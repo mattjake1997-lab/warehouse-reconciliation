@@ -1,0 +1,24 @@
+{
+  "name": "warehouse-reconciliation",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "xlsx": "^0.18.5",
+    "docx": "^8.5.0",
+    "file-saver": "^2.0.5",
+    "pdfjs-dist": "3.11.174",
+    "mammoth": "^1.8.0",
+    "lucide-react": "^0.383.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^4.4.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}
