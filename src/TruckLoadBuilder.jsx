@@ -80,20 +80,24 @@ function parseAvailabilityWorkbook(workbook) {
 
 // ---------------------------------------------------------------------------
 // PDF parsing — "Items Needing Replenishment" export
-// This reconstructs rows from pdf.js text items by grouping tokens with
-// similar Y position onto the same line, then reading numeric columns from
-// the right-hand side (Move Pallets is the last column, Move Qty second-
-// to-last, etc). PDF text extraction is inherently a bit fragile — if your
-// actual export lines up differently, this is the function to adjust.
+// Only two things are read from each row: the ITEM number and the EVV Move
+// pallet count. Everything else on the row (description, on-site / off-site
+// counts, status...) is ignored — item descriptions come from the inventory
+// file instead.
 // ---------------------------------------------------------------------------
-async function parseNeedsPdf(file) {
+
+// Pulls the text out of a PDF as plain lines (tokens grouped by vertical
+// position, read left to right).
+async function extractPdfLines(file) {
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
 
   const lines = [];
+  let textItems = 0;
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
     const content = await page.getTextContent();
+    textItems += content.items.filter((it) => it.str && it.str.trim()).length;
 
     const rows = new Map(); // roundedY -> [{x, str}]
     for (const item of content.items) {
@@ -119,55 +123,58 @@ async function parseNeedsPdf(file) {
     }
   }
 
-  // A data row starts with a 5-6 digit item number.
-  const rowPattern = /^(\d{5,6})\s+(.*)$/;
-  const statusPattern = /\b(Active|Phase-Out|Purge|Inactive)\b/;
-  const numberPattern = /-?[\d,]+(?:\.\d+)?/g;
-  const needs = [];
+  if (textItems === 0) {
+    throw new Error(
+      "This PDF has no readable text — it's a picture of the table (like a screenshot), so the numbers can't be read reliably. Save or export the report to PDF straight from the source instead."
+    );
+  }
+  return lines;
+}
 
+// A data row starts with a 5-6 digit item number. The EVV Move numbers sit at
+// the far right of the row, so they're read from the end of the line — that
+// keeps stray digits in the description or date columns from interfering.
+//
+// The export's right-hand columns are  EVV Move Qty | EVV Move Pallets, and
+// sometimes a trailing Pallet Qty (units per pallet) after them. When that
+// trailing column is there, Move Qty ÷ Pallet Qty = Move Pallets, which is
+// how the layout is detected (and how a misread row gets caught).
+function parseNeedsLines(lines) {
+  const rows = [];
   for (const line of lines) {
-    const match = line.match(rowPattern);
-    if (!match) continue;
-
-    const itemNumber = match[1];
-    const rest = match[2];
-
-    // The last two numbers on the line are always EVV Move Qty and EVV Move
-    // Pallets (the two rightmost columns), regardless of how many stray
-    // digits show up earlier from the description (e.g. "550MHz", "1x4").
-    const allNumbers = [...rest.matchAll(numberPattern)];
-    if (allNumbers.length < 2) continue;
-    const movePallets = Number(allNumbers[allNumbers.length - 1][0].replace(/,/g, ""));
-    const moveQty = Number(allNumbers[allNumbers.length - 2][0].replace(/,/g, ""));
-
-    // Description: everything before the 3 numeric columns (On-Site Min,
-    // On-Site OH#, Off-Site OH#) that sit right before the Status word.
-    // Anchoring on Status avoids being fooled by numbers embedded in the
-    // description itself.
-    const statusMatch = statusPattern.exec(rest);
-    const status = statusMatch ? statusMatch[1] : "Unknown";
-    const beforeStatus = statusMatch ? rest.slice(0, statusMatch.index) : rest;
-    const numsBeforeStatus = [...beforeStatus.matchAll(numberPattern)];
-    const description =
-      numsBeforeStatus.length >= 3
-        ? beforeStatus.slice(0, numsBeforeStatus[numsBeforeStatus.length - 3].index).trim().replace(/,\s*$/, "")
-        : beforeStatus.trim();
-
-    if (!Number.isFinite(movePallets) || movePallets <= 0) continue;
-
-    needs.push({
-      item: itemNumber,
-      description,
-      status,
-      moveQty,
-      movePallets,
-    });
+    const m = line.match(/^(\d{5,6})\s+(.*)$/);
+    if (!m) continue;
+    const nums = [...m[2].matchAll(/\d[\d,]*/g)].map((n) => Number(n[0].replace(/,/g, "")));
+    if (nums.length >= 2) rows.push({ item: m[1], nums });
   }
 
-  // Keep the dashboard's own ordering (already sorted by Move Pallets desc),
-  // but re-sort defensively in case a page break disturbed it.
+  const addsUp = (nums) => {
+    if (nums.length < 3) return false;
+    const [qty, pallets, perPallet] = nums.slice(-3);
+    return perPallet > 0 && Math.abs(qty / perPallet - pallets) <= 1;
+  };
+  const hasPalletQtyColumn = rows.filter((r) => addsUp(r.nums)).length >= rows.length / 2;
+
+  const needs = [];
+  const flagged = []; // rows whose numbers didn't line up — worth a second look
+  for (const r of rows) {
+    const movePallets = hasPalletQtyColumn ? r.nums[r.nums.length - 2] : r.nums[r.nums.length - 1];
+    if (!Number.isFinite(movePallets) || movePallets <= 0) continue;
+
+    const implausible = movePallets > 100; // a trailer holds ~26 spots, so this is a misread
+    if (implausible || (hasPalletQtyColumn && !addsUp(r.nums))) flagged.push(r.item);
+    if (implausible) continue;
+
+    needs.push({ item: r.item, description: "", movePallets });
+  }
+
+  // Keep the export's own ordering (highest EVV Move first = build priority).
   needs.sort((a, b) => b.movePallets - a.movePallets);
-  return needs;
+  return { needs, flagged };
+}
+
+async function parseNeedsPdf(file) {
+  return parseNeedsLines(await extractPdfLines(file));
 }
 
 // Warehouses are tried in this order when picking which single warehouse to
@@ -221,6 +228,7 @@ function buildLoadForWarehouse(needs, availability, warehouse, target = TARGET_S
         warehouse,
         skids: take,
         availableAtWarehouse: countAtWarehouse,
+        needed: need.movePallets,
         doubleStack,
         weight: estimateWeight(need.item, take) ?? "",
         weightIsEstimate: estimateWeight(need.item, take) != null,
@@ -266,6 +274,7 @@ function buildAllCandidates(needs, availability) {
 export default function TruckLoadBuilder() {
   const [availability, setAvailability] = useState(null); // Map
   const [needs, setNeeds] = useState(null); // array
+  const [needsFlagged, setNeedsFlagged] = useState([]); // item numbers whose pallet count looked off
   const [candidates, setCandidates] = useState([]); // one per warehouse with stock
   const [selectedWarehouse, setSelectedWarehouse] = useState(null);
   const [lineItems, setLineItems] = useState([]);
@@ -440,11 +449,14 @@ export default function TruckLoadBuilder() {
     setError(null);
     setLoadingNeeds(true);
     try {
-      const parsed = await parseNeedsPdf(file);
+      const { needs: parsed, flagged } = await parseNeedsPdf(file);
+      setNeedsFlagged(flagged);
       if (parsed.length === 0) {
+        setNeeds(null);
         setError(
-          "Couldn't find any item rows in that PDF. The export's layout may not match what this parser expects — see the comments in parseNeedsPdf."
+          "Read the PDF's text but couldn't find any rows with an item number followed by an EVV Move pallet count. Check that this is the Items Needing Replenishment export."
         );
+        return;
       }
       setNeeds(parsed);
       rebuild(parsed, availability);
@@ -487,6 +499,7 @@ export default function TruckLoadBuilder() {
         warehouse: selectedWarehouse,
         skids: Math.min(1, countAtWarehouse),
         availableAtWarehouse: countAtWarehouse,
+        needed: need.movePallets,
         doubleStack: isDoubleStackable(need.item),
         weight: estimateWeight(need.item, Math.min(1, countAtWarehouse)) ?? "",
         weightIsEstimate: estimateWeight(need.item, Math.min(1, countAtWarehouse)) != null,
@@ -525,7 +538,7 @@ export default function TruckLoadBuilder() {
           accept=".pdf"
           onFile={handleNeedsUpload}
           loading={loadingNeeds}
-          status={needs ? `${needs.length} items needed` : "No file uploaded yet"}
+          status={needs && needs.length ? `${needs.length} items needed` : "No file uploaded yet"}
         />
       </div>
 
@@ -574,6 +587,23 @@ export default function TruckLoadBuilder() {
         </div>
       )}
 
+      {needsFlagged.length > 0 && (
+        <div
+          style={{
+            background: "var(--amber-bg)",
+            color: "var(--amber-light)",
+            padding: "10px 14px",
+            borderRadius: 8,
+            fontSize: 13,
+            marginBottom: 16,
+            border: "1px solid #5a3d0a",
+          }}
+        >
+          The EVV Move numbers for {needsFlagged.join(", ")} didn't line up with the rest of the row — double-check
+          those pallet counts against the PDF before booking.
+        </div>
+      )}
+
       {selectedWarehouse && !isFullLoad && (
         <div
           style={{
@@ -612,6 +642,7 @@ export default function TruckLoadBuilder() {
               <th style={cellStyle}>Item</th>
               <th style={cellStyle}>Description</th>
               <th style={cellStyle}>From</th>
+              <th style={cellStyle}>Need (EVV Move)</th>
               <th style={cellStyle}>Skids</th>
               <th style={cellStyle}>Spots</th>
               <th style={cellStyle}>Weight</th>
@@ -640,6 +671,7 @@ export default function TruckLoadBuilder() {
                   )}
                 </td>
                 <td style={cellStyle}>{li.warehouse}</td>
+                <td style={cellStyle}>{li.needed ?? "—"}</td>
                 <td style={cellStyle}>
                   <button onClick={() => adjustSkids(li.id, -1)}>-</button>
                   <span style={{ margin: "0 8px" }}>{li.skids}</span>
@@ -799,7 +831,7 @@ export default function TruckLoadBuilder() {
               {unmet.map((u) => (
                 <tr key={u.item}>
                   <td style={cellStyle}>{u.item}</td>
-                  <td style={cellStyle}>{u.description}</td>
+                  <td style={cellStyle}>{u.description || availability?.get(u.item)?.description || ""}</td>
                   <td style={{ ...cellStyle, color: "var(--amber-light)" }}>{u.reason}</td>
                   <td style={{ ...cellStyle, textAlign: "right" }}>
                     {(availability?.get(u.item)?.byWarehouse?.[selectedWarehouse]?.length || 0) > 0 && (
