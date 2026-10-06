@@ -58,6 +58,25 @@ function valueCell(text, opts = {}) {
   });
 }
 
+const fmtNum = (n) => Number(n).toLocaleString("en-US");
+
+// Same as labeledValueCell, but the value sits on its own line in large bold
+// type — used for the BOL number and carrier name so they can be read at a
+// glance on the printed page.
+function labeledBigValueCell(label, value, opts = {}) {
+  return new TableCell({
+    borders: CELL_BORDERS,
+    width: opts.width,
+    columnSpan: opts.columnSpan,
+    rowSpan: opts.rowSpan,
+    verticalAlign: VerticalAlign.TOP,
+    children: [
+      new Paragraph({ children: [new TextRun({ text: label, bold: true, size: 18 })] }),
+      new Paragraph({ children: [new TextRun({ text: String(value ?? ""), bold: true, size: 40 })] }),
+    ],
+  });
+}
+
 function labeledValueCell(label, value, opts = {}) {
   return new TableCell({
     borders: CELL_BORDERS,
@@ -106,7 +125,7 @@ export function generateBolNumber(lineItems, date = new Date()) {
 }
 
 /**
- * Generates a shippable Bill of Lading .docx and downloads it.
+ * Builds a shippable Bill of Lading document (see generateBOL to download it).
  *
  * @param {Object} params
  * @param {string} params.warehouse - "EAB" | "WSI" | "WS2"
@@ -117,7 +136,7 @@ export function generateBolNumber(lineItems, date = new Date()) {
  * @param {string} [params.date] - defaults to today
  * @param {string} [params.specialInstructions] - defaults to standard text
  */
-export async function generateBOL({
+export function buildBolDocument({
   warehouse,
   lineItems,
   carrierName,
@@ -131,6 +150,10 @@ export async function generateBOL({
   const shipTo = WAREHOUSE_ADDRESSES.MAIN;
   const displayDate = date || new Date().toLocaleDateString("en-US");
   const grandTotal = lineItems.reduce((sum, li) => sum + Number(li.skids || 0), 0);
+  // Total weight is only filled in when every line has a weight — a total that
+  // quietly leaves a line out would be wrong, so it's left blank to hand-fill.
+  const allWeighed = lineItems.length > 0 && lineItems.every((li) => Number(li.weight) > 0);
+  const grandWeight = allWeighed ? lineItems.reduce((sum, li) => sum + Number(li.weight), 0) : null;
   const instructions = specialInstructions || "Special Instructions: (deliver between 8-3)";
 
   const headerRow = new TableRow({
@@ -159,14 +182,14 @@ export async function generateBOL({
   const shipFromToRow = new TableRow({
     children: [
       valueCell(`Ship From\n\n${shipFrom}`, { columnSpan: 2 }),
-      labeledValueCell("Bill of Lading Number:", bolNumber),
+      labeledBigValueCell("Bill of Lading Number:", bolNumber),
     ],
   });
 
   const shipToRow = new TableRow({
     children: [
       valueCell(`Ship To\n\n${shipTo}`, { columnSpan: 2 }),
-      labeledValueCell("Carrier Name:", carrierName),
+      labeledBigValueCell("Carrier Name:", carrierName),
     ],
   });
 
@@ -196,7 +219,7 @@ export async function generateBOL({
         children: [
           valueCell(`${li.item}${li.description ? " — " + li.description : ""}`),
           valueCell(String(li.skids)),
-          valueCell(li.weight ? String(li.weight) : ""), // left blank for hand-fill if not provided
+          valueCell(Number(li.weight) > 0 ? fmtNum(li.weight) : ""), // left blank for hand-fill if not provided
           valueCell("Pallet / Slip"),
         ],
       })
@@ -206,7 +229,7 @@ export async function generateBOL({
     children: [
       labelCell("Grand Total"),
       valueCell(String(grandTotal)),
-      valueCell(""),
+      valueCell(grandWeight != null ? fmtNum(grandWeight) : ""),
       valueCell(""),
     ],
   });
@@ -292,7 +315,13 @@ export async function generateBOL({
     ],
   });
 
+  return doc;
+}
+
+/** Builds the Bill of Lading and downloads it as a .docx. Same params as buildBolDocument. */
+export async function generateBOL(params) {
+  const doc = buildBolDocument(params);
   const blob = await Packer.toBlob(doc);
-  const filename = `BOL_${warehouse}_${bolNumber || "draft"}.docx`;
+  const filename = `BOL_${params.warehouse}_${params.bolNumber || "draft"}.docx`;
   saveAs(blob, filename);
 }

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo } from "react";
 import * as XLSX from "xlsx";
 import * as pdfjsLib from "pdfjs-dist";
 import { generateBOL, generateBolNumber, carrierForWarehouse } from "./bolGenerator";
@@ -184,88 +184,125 @@ async function parseNeedsPdf(file) {
 const WAREHOUSE_ORDER = ["EAB", "WS2", "WSI"];
 
 // ---------------------------------------------------------------------------
-// Load building — loads never mix warehouses. This builds one candidate load
-// per warehouse, using only that warehouse's stock, filling toward
-// TARGET_SKIDS trailer spots in needs-list order (already ranked by Move
-// Pallets, highest first).
+// Truck building — loads never mix warehouses, and a skid can only be on one
+// truck. A skid is "spoken for" once it's on a BOL generated today, or on
+// another warehouse's truck that's still being built. Those skids come out of
+// the needs list and out of that warehouse's available count, so the same
+// item never lands on two trucks unless the need is bigger than what the first
+// warehouse had.
 // ---------------------------------------------------------------------------
-function buildLoadForWarehouse(needs, availability, warehouse, target = TARGET_SKIDS) {
-  const lineItems = [];
-  const unmet = [];
-  let spotsUsed = 0;
+const EMPTY_LINES = [];
 
-  for (const need of needs) {
-    if (spotsUsed >= target) {
-      unmet.push({ ...need, reason: "Load already full" });
-      continue;
-    }
-
-    const avail = availability.get(need.item);
-    const countAtWarehouse = avail?.byWarehouse?.[warehouse]?.length || 0;
-
-    if (!avail) {
-      unmet.push({ ...need, reason: "Not in offsite inventory" });
-      continue;
-    }
-    if (countAtWarehouse === 0) {
-      unmet.push({ ...need, reason: `Not available at ${warehouse}` });
-      continue;
-    }
-
-    const doubleStack = isDoubleStackable(need.item);
-    const spotsRemaining = target - spotsUsed;
-    const maxSkidsBySpots = doubleStack
-      ? Math.floor(spotsRemaining * 2)
-      : Math.floor(spotsRemaining);
-
-    const take = Math.min(countAtWarehouse, need.movePallets, maxSkidsBySpots);
-
-    if (take > 0) {
-      lineItems.push({
-        id: `${need.item}-${warehouse}`,
-        item: need.item,
-        description: need.description || avail.description,
-        warehouse,
-        skids: take,
-        availableAtWarehouse: countAtWarehouse,
-        needed: need.movePallets,
-        doubleStack,
-        weight: estimateWeight(need.item, take) ?? "",
-        weightIsEstimate: estimateWeight(need.item, take) != null,
-      });
-      spotsUsed += spotsForSkids(need.item, take);
-    }
-
-    if (need.movePallets > countAtWarehouse) {
-      unmet.push({
-        ...need,
-        reason: `Only ${countAtWarehouse} of ${need.movePallets} available at ${warehouse}`,
-      });
-    } else if (take < need.movePallets) {
-      unmet.push({ ...need, reason: "Load already full" });
-    }
-  }
-
-  return { warehouse, lineItems, unmet, spotsUsed, isFull: spotsUsed >= target };
+function todayStr() {
+  return new Date().toLocaleDateString("en-US");
 }
 
-// Builds one candidate per warehouse that actually has any stock at all, and
-// picks a default: the first (in priority order) that fills a full truck;
-// if none do, the one that gets closest, flagged as not full.
-function buildAllCandidates(needs, availability) {
-  const warehousesPresent = WAREHOUSE_ORDER.filter((wh) =>
-    Array.from(availability.values()).some((entry) => (entry.byWarehouse[wh]?.length || 0) > 0)
+const fmtNum = (n) => Number(n).toLocaleString("en-US");
+
+// Skids already on today's BOLs — overall, and per warehouse.
+function summarizeBooked(loads) {
+  const byItem = {};
+  const byItemWh = {};
+  for (const load of loads) {
+    for (const it of load.items || []) {
+      const n = Number(it.skids) || 0;
+      byItem[it.item] = (byItem[it.item] || 0) + n;
+      const key = `${it.item}|${load.warehouse}`;
+      byItemWh[key] = (byItemWh[key] || 0) + n;
+    }
+  }
+  return { byItem, byItemWh };
+}
+
+// Skids a warehouse still has: its count in the inventory file, minus what's
+// already gone out on today's BOLs from that warehouse.
+function stockAt(availability, booked, item, warehouse) {
+  const count = availability?.get(item)?.byWarehouse?.[warehouse]?.length || 0;
+  return Math.max(0, count - (booked.byItemWh[`${item}|${warehouse}`] || 0));
+}
+
+// Skids of an item sitting on the OTHER warehouses' in-progress trucks.
+function skidsOnOtherTrucks(trucks, item, warehouse) {
+  let total = 0;
+  for (const [wh, lines] of Object.entries(trucks)) {
+    if (wh === warehouse) continue;
+    for (const l of lines) if (l.item === item) total += l.skids;
+  }
+  return total;
+}
+
+// What's still needed of an item for the truck being built at `warehouse`
+// (before counting what's already on that truck): the EVV Move number, minus
+// skids on today's BOLs, minus skids on the other warehouses' trucks.
+function remainingNeed(need, booked, trucks, warehouse) {
+  return Math.max(
+    0,
+    need.movePallets - (booked.byItem[need.item] || 0) - skidsOnOtherTrucks(trucks, need.item, warehouse)
   );
+}
 
-  const candidates = warehousesPresent.map((wh) =>
-    buildLoadForWarehouse(needs, availability, wh)
-  );
+// Adds skids of an item to a truck, merging into its existing line if it has one.
+function addSkidsToLines(lines, { item, description, warehouse, qty, doubleStack }) {
+  if (lines.some((l) => l.item === item)) {
+    return lines.map((l) => {
+      if (l.item !== item) return l;
+      const skids = l.skids + qty;
+      const updated = { ...l, skids };
+      if (l.weightIsEstimate || !l.weight) {
+        const est = estimateWeight(item, skids);
+        updated.weight = est ?? "";
+        updated.weightIsEstimate = est != null;
+      }
+      return updated;
+    });
+  }
+  const est = estimateWeight(item, qty);
+  return [
+    ...lines,
+    {
+      id: `${item}-${warehouse}`,
+      item,
+      description,
+      warehouse,
+      skids: qty,
+      doubleStack,
+      weight: est ?? "",
+      weightIsEstimate: est != null,
+    },
+  ];
+}
 
-  const fullCandidate = candidates.find((c) => c.isFull);
-  const defaultCandidate =
-    fullCandidate || candidates.reduce((best, c) => (c.spotsUsed > (best?.spotsUsed ?? -1) ? c : best), null);
+// Optional auto-fill: walks the needs list in order (highest EVV Move first)
+// and adds what's still needed, limited by what this warehouse has left and
+// the trailer's remaining spots. Anything already on the truck is kept.
+function fillTruck({ needs, availability, booked, trucks, warehouse, lines, target = TARGET_SKIDS }) {
+  let result = lines;
+  let spots = result.reduce((s, l) => s + spotsForSkids(l.item, l.skids), 0);
 
-  return { candidates, defaultWarehouse: defaultCandidate?.warehouse ?? null };
+  for (const need of needs) {
+    if (spots >= target) break;
+    const onTruck = result.find((l) => l.item === need.item)?.skids || 0;
+    const want = remainingNeed(need, booked, trucks, warehouse) - onTruck;
+    if (want <= 0) continue;
+    const room = stockAt(availability, booked, need.item, warehouse) - onTruck;
+    if (room <= 0) continue;
+
+    const doubleStack = isDoubleStackable(need.item);
+    const spotsLeft = target - spots;
+    const bySpots = doubleStack ? Math.floor(spotsLeft * 2) : Math.floor(spotsLeft);
+    const qty = Math.min(want, room, bySpots);
+    if (qty <= 0) continue;
+
+    result = addSkidsToLines(result, {
+      item: need.item,
+      description: availability.get(need.item)?.description || need.description || "",
+      warehouse,
+      qty,
+      doubleStack,
+    });
+    spots += spotsForSkids(need.item, qty);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,16 +312,13 @@ export default function TruckLoadBuilder() {
   const [availability, setAvailability] = useState(null); // Map
   const [needs, setNeeds] = useState(null); // array
   const [needsFlagged, setNeedsFlagged] = useState([]); // item numbers whose pallet count looked off
-  const [candidates, setCandidates] = useState([]); // one per warehouse with stock
   const [selectedWarehouse, setSelectedWarehouse] = useState(null);
-  const [lineItems, setLineItems] = useState([]);
-  const [unmet, setUnmet] = useState([]);
+  const [trucks, setTrucks] = useState({}); // warehouse -> line items being built
+  const [forms, setForms] = useState({}); // warehouse -> typed-over carrier / SCAC / BOL number
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [loadingAvail, setLoadingAvail] = useState(false);
   const [loadingNeeds, setLoadingNeeds] = useState(false);
-  const [carrierName, setCarrierName] = useState("");
-  const [scac, setScac] = useState("");
-  const [bolNumber, setBolNumber] = useState("");
   const [generatingBol, setGeneratingBol] = useState(false);
 
   const [signatureNames, setSignatureNames] = useState(() => {
@@ -307,16 +341,32 @@ export default function TruckLoadBuilder() {
     }
   });
 
-  const todayStr = () => new Date().toLocaleDateString("en-US");
+  const saveHistory = (updated) => {
+    try {
+      localStorage.setItem("truckLoadBuilder.loadHistory", JSON.stringify(updated));
+    } catch {
+      // localStorage unavailable — history just won't persist across reloads
+    }
+  };
 
   const logFinalizedLoad = (record) => {
     setLoadHistory((prev) => {
       const updated = [record, ...prev].slice(0, 200); // keep the log from growing forever
-      try {
-        localStorage.setItem("truckLoadBuilder.loadHistory", JSON.stringify(updated));
-      } catch {
-        // localStorage unavailable — history just won't persist across reloads
-      }
+      saveHistory(updated);
+      return updated;
+    });
+  };
+
+  // Putting a BOL back: its skids return to the needs list and to that
+  // warehouse's available count.
+  const releaseLoad = (record) => {
+    const ok = window.confirm(
+      `Release BOL ${record.bolNumber} (${record.warehouse}, ${record.totalSkids} skids)? Its skids go back into the needs list and ${record.warehouse}'s available count.`
+    );
+    if (!ok) return;
+    setLoadHistory((prev) => {
+      const updated = prev.filter((h) => h !== record);
+      saveHistory(updated);
       return updated;
     });
   };
@@ -342,13 +392,135 @@ export default function TruckLoadBuilder() {
     }
   };
 
+  // ---- derived state -------------------------------------------------------
+  const warehousesPresent = useMemo(
+    () =>
+      !availability
+        ? []
+        : WAREHOUSE_ORDER.filter((wh) =>
+            Array.from(availability.values()).some((entry) => (entry.byWarehouse[wh]?.length || 0) > 0)
+          ),
+    [availability]
+  );
+  const active =
+    selectedWarehouse && warehousesPresent.includes(selectedWarehouse)
+      ? selectedWarehouse
+      : warehousesPresent[0] || null;
+  const lineItems = (active && trucks[active]) || EMPTY_LINES;
+
+  const todaysLoads = useMemo(() => loadHistory.filter((h) => h.date === todayStr()), [loadHistory]);
+  const booked = useMemo(() => summarizeBooked(todaysLoads), [todaysLoads]);
+
+  const skidsUsed = lineItems.reduce((sum, li) => sum + li.skids, 0);
+  const spotsUsed = lineItems.reduce((sum, li) => sum + spotsForSkids(li.item, li.skids), 0);
+  const spotsLeft = Math.max(0, TARGET_SKIDS - spotsUsed);
+  const totalWeight =
+    lineItems.length > 0 && lineItems.every((li) => Number(li.weight) > 0)
+      ? lineItems.reduce((sum, li) => sum + Number(li.weight), 0)
+      : null;
+
+  // One row per item on the needs list, with what's still unassigned for the
+  // truck currently being built.
+  const pool = useMemo(() => {
+    if (!needs || !availability || !active) return [];
+    return needs.map((n) => {
+      const here = lineItems.find((l) => l.item === n.item)?.skids || 0;
+      const bookedAll = booked.byItem[n.item] || 0;
+      const elsewhere = skidsOnOtherTrucks(trucks, n.item, active);
+      const remaining = remainingNeed(n, booked, trucks, active);
+      const stock = {};
+      for (const wh of warehousesPresent) stock[wh] = stockAt(availability, booked, n.item, wh);
+      return {
+        ...n,
+        description: availability.get(n.item)?.description || n.description || "",
+        inInventory: availability.has(n.item),
+        here,
+        bookedAll,
+        elsewhere,
+        remaining,
+        unassigned: Math.max(0, remaining - here),
+        stock,
+      };
+    });
+  }, [needs, availability, active, lineItems, booked, trucks, warehousesPresent]);
+
+  const needByItem = useMemo(() => new Map(pool.map((r) => [r.item, r])), [pool]);
+  const stillNeeded = pool.filter((r) => r.unassigned > 0);
+  const coveredElsewhere = pool.filter(
+    (r) => r.unassigned === 0 && r.here === 0 && r.bookedAll + r.elsewhere > 0
+  );
+
+  // BOL form: carrier / SCAC / BOL number follow the truck unless typed over.
+  const form = (active && forms[active]) || {};
+  const carrierName = form.carrierName ?? carrierForWarehouse(active);
+  const scac = form.scac ?? "";
+  const bolNumber = form.bolNumber ?? generateBolNumber(lineItems);
+  const setFormField = (field, value) =>
+    setForms((prev) => ({ ...prev, [active]: { ...(prev[active] || {}), [field]: value } }));
+
+  // ---- truck actions ---------------------------------------------------------
+  const setLines = (updater) => {
+    if (!active) return;
+    setTrucks((prev) => ({ ...prev, [active]: updater(prev[active] || EMPTY_LINES) }));
+  };
+
+  const selectWarehouse = (wh) => {
+    setNotice(null);
+    setSelectedWarehouse(wh);
+  };
+
+  const addToTruck = (row, qty) => {
+    if (qty <= 0) return;
+    setNotice(null);
+    setLines((prev) =>
+      addSkidsToLines(prev, {
+        item: row.item,
+        description: row.description,
+        warehouse: active,
+        qty,
+        doubleStack: isDoubleStackable(row.item),
+      })
+    );
+  };
+
+  const autoFill = () => {
+    if (!needs || !availability) return;
+    setNotice(null);
+    setLines((prev) => fillTruck({ needs, availability, booked, trucks, warehouse: active, lines: prev }));
+  };
+
+  const clearTruck = () => {
+    setNotice(null);
+    setLines(() => EMPTY_LINES);
+  };
+
+  const removeLineItem = (id) => {
+    setLines((prev) => prev.filter((li) => li.id !== id));
+  };
+
   const setLineWeight = (id, weight) => {
-    setLineItems((prev) =>
-      prev.map((li) => (li.id === id ? { ...li, weight, weightIsEstimate: false } : li))
+    setLines((prev) => prev.map((li) => (li.id === id ? { ...li, weight, weightIsEstimate: false } : li)));
+  };
+
+  const adjustSkids = (id, delta) => {
+    setLines((prev) =>
+      prev.flatMap((li) => {
+        if (li.id !== id) return [li];
+        const stock = stockAt(availability, booked, li.item, active);
+        const next = Math.max(0, Math.min(stock, li.skids + delta));
+        if (next === 0) return []; // taking off the last skid takes the line off the truck
+        const updated = { ...li, skids: next };
+        if (li.weightIsEstimate) {
+          const est = estimateWeight(li.item, next);
+          updated.weight = est ?? "";
+        }
+        return [updated];
+      })
     );
   };
 
   const handleGenerateBol = async () => {
+    if (!active || lineItems.length === 0) return;
     const duplicate = findTodaysDuplicate(bolNumber);
     if (duplicate) {
       const proceed = window.confirm(
@@ -357,10 +529,11 @@ export default function TruckLoadBuilder() {
       if (!proceed) return;
     }
 
+    const warehouse = active;
     setGeneratingBol(true);
     try {
       await generateBOL({
-        warehouse: selectedWarehouse,
+        warehouse,
         lineItems,
         carrierName,
         scac,
@@ -370,7 +543,7 @@ export default function TruckLoadBuilder() {
       logFinalizedLoad({
         date: todayStr(),
         timestamp: new Date().toISOString(),
-        warehouse: selectedWarehouse,
+        warehouse,
         bolNumber,
         carrierName,
         signatureName: selectedSignature,
@@ -378,6 +551,16 @@ export default function TruckLoadBuilder() {
         totalSpots: Math.ceil(spotsUsed),
         items: lineItems.map((li) => ({ item: li.item, skids: li.skids, weight: li.weight })),
       });
+      // The truck is done: clear it so the next one starts fresh. Its skids now
+      // count as ordered via today's BOL log.
+      setTrucks((prev) => ({ ...prev, [warehouse]: EMPTY_LINES }));
+      setForms((prev) => {
+        const { [warehouse]: _done, ...rest } = prev;
+        return rest;
+      });
+      setNotice(
+        `BOL ${bolNumber} downloaded — ${skidsUsed} skids from ${warehouse} now count as ordered. They're off the needs list and out of ${warehouse}'s available count.`
+      );
     } catch (err) {
       setError(`Couldn't generate the BOL: ${err.message}`);
     } finally {
@@ -385,48 +568,7 @@ export default function TruckLoadBuilder() {
     }
   };
 
-  const skidsUsed = useMemo(
-    () => lineItems.reduce((sum, li) => sum + li.skids, 0),
-    [lineItems]
-  );
-
-  const spotsUsed = useMemo(
-    () => lineItems.reduce((sum, li) => sum + spotsForSkids(li.item, li.skids), 0),
-    [lineItems]
-  );
-
-  const isFullLoad = spotsUsed >= TARGET_SKIDS;
-
-  const selectWarehouse = useCallback(
-    (wh, candidateList) => {
-      const list = candidateList || candidates;
-      const candidate = list.find((c) => c.warehouse === wh);
-      if (!candidate) return;
-      setSelectedWarehouse(wh);
-      setLineItems(candidate.lineItems);
-      setUnmet(candidate.unmet);
-      setBolNumber(generateBolNumber(candidate.lineItems));
-      setCarrierName(carrierForWarehouse(wh));
-    },
-    [candidates]
-  );
-
-  const rebuild = useCallback(
-    (needsList, availMap) => {
-      if (!needsList || !availMap) return;
-      const { candidates: newCandidates, defaultWarehouse } = buildAllCandidates(needsList, availMap);
-      setCandidates(newCandidates);
-      if (defaultWarehouse) {
-        selectWarehouse(defaultWarehouse, newCandidates);
-      } else {
-        setSelectedWarehouse(null);
-        setLineItems([]);
-        setUnmet([]);
-      }
-    },
-    [selectWarehouse]
-  );
-
+  // ---- file uploads ----------------------------------------------------------
   const handleAvailabilityUpload = async (file) => {
     if (!file) return;
     setError(null);
@@ -434,9 +576,7 @@ export default function TruckLoadBuilder() {
     try {
       const buf = await file.arrayBuffer();
       const wb = XLSX.read(buf, { type: "array" });
-      const parsed = parseAvailabilityWorkbook(wb);
-      setAvailability(parsed);
-      rebuild(needs, parsed);
+      setAvailability(parseAvailabilityWorkbook(wb));
     } catch (err) {
       setError(`Couldn't read that Excel file: ${err.message}`);
     } finally {
@@ -459,7 +599,6 @@ export default function TruckLoadBuilder() {
         return;
       }
       setNeeds(parsed);
-      rebuild(parsed, availability);
     } catch (err) {
       setError(`Couldn't read that PDF: ${err.message}`);
     } finally {
@@ -467,46 +606,15 @@ export default function TruckLoadBuilder() {
     }
   };
 
-  const removeLineItem = (id) => {
-    setLineItems((prev) => prev.filter((li) => li.id !== id));
-  };
-
-  const adjustSkids = (id, delta) => {
-    setLineItems((prev) =>
-      prev.map((li) => {
-        if (li.id !== id) return li;
-        const next = Math.max(0, Math.min(li.availableAtWarehouse, li.skids + delta));
-        const updated = { ...li, skids: next };
-        if (li.weightIsEstimate) {
-          const est = estimateWeight(li.item, next);
-          updated.weight = est ?? "";
-        }
-        return updated;
-      })
-    );
-  };
-
-  const addUnmetItem = (need) => {
-    const avail = availability?.get(need.item);
-    const countAtWarehouse = avail?.byWarehouse?.[selectedWarehouse]?.length || 0;
-    if (!avail || countAtWarehouse === 0) return;
-    setLineItems((prev) => [
-      ...prev,
-      {
-        id: `${need.item}-${selectedWarehouse}-${Date.now()}`,
-        item: need.item,
-        description: need.description || avail.description,
-        warehouse: selectedWarehouse,
-        skids: Math.min(1, countAtWarehouse),
-        availableAtWarehouse: countAtWarehouse,
-        needed: need.movePallets,
-        doubleStack: isDoubleStackable(need.item),
-        weight: estimateWeight(need.item, Math.min(1, countAtWarehouse)) ?? "",
-        weightIsEstimate: estimateWeight(need.item, Math.min(1, countAtWarehouse)) != null,
-      },
-    ]);
-    setUnmet((prev) => prev.filter((u) => u.item !== need.item));
-  };
+  const banner = (kind) => ({
+    background: `var(--${kind}-bg)`,
+    color: kind === "red" ? "var(--red-light)" : kind === "green" ? "var(--green-light)" : "var(--amber-light)",
+    padding: "10px 14px",
+    borderRadius: 8,
+    fontSize: 13,
+    marginBottom: 16,
+    border: `1px solid ${kind === "red" ? "#5a1515" : kind === "green" ? "var(--green)" : "#5a3d0a"}`,
+  });
 
   return (
     <div style={{ fontFamily: "inherit" }}>
@@ -525,11 +633,7 @@ export default function TruckLoadBuilder() {
           accept=".xlsx,.xls"
           onFile={handleAvailabilityUpload}
           loading={loadingAvail}
-          status={
-            availability
-              ? `${availability.size} parts loaded`
-              : "No file uploaded yet"
-          }
+          status={availability ? `${availability.size} parts loaded` : "No file uploaded yet"}
         />
         <UploadCard
           header="EVV DC PDF"
@@ -542,98 +646,92 @@ export default function TruckLoadBuilder() {
         />
       </div>
 
-      {candidates.length > 0 && (
-        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-          {candidates.map((c) => (
-            <button
-              key={c.warehouse}
-              onClick={() => selectWarehouse(c.warehouse)}
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                textAlign: "left",
-                borderRadius: 8,
-                border:
-                  c.warehouse === selectedWarehouse
-                    ? "2px solid var(--accent)"
-                    : "1px solid var(--border-mid)",
-                background: "var(--bg-card)",
-                color: "var(--text-primary)",
-              }}
-            >
-              <div style={{ fontSize: 13, fontWeight: 500 }}>{c.warehouse}</div>
-              <div style={{ fontSize: 12, color: c.isFull ? "var(--green-light)" : "var(--amber-light)" }}>
-                {Math.ceil(c.spotsUsed)} / {TARGET_SKIDS} spots
-                {c.isFull ? " · full" : ""}
-              </div>
-            </button>
-          ))}
-        </div>
-      )}
-
-      {error && (
-        <div
-          style={{
-            background: "var(--red-bg)",
-            color: "var(--red-light)",
-            padding: "10px 14px",
-            borderRadius: 8,
-            fontSize: 13,
-            marginBottom: 16,
-            border: "1px solid #5a1515",
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <div style={banner("red")}>{error}</div>}
 
       {needsFlagged.length > 0 && (
-        <div
-          style={{
-            background: "var(--amber-bg)",
-            color: "var(--amber-light)",
-            padding: "10px 14px",
-            borderRadius: 8,
-            fontSize: 13,
-            marginBottom: 16,
-            border: "1px solid #5a3d0a",
-          }}
-        >
+        <div style={banner("amber")}>
           The EVV Move numbers for {needsFlagged.join(", ")} didn't line up with the rest of the row — double-check
           those pallet counts against the PDF before booking.
         </div>
       )}
 
-      {selectedWarehouse && !isFullLoad && (
-        <div
-          style={{
-            background: "var(--amber-bg)",
-            color: "var(--amber-light)",
-            padding: "10px 14px",
-            borderRadius: 8,
-            fontSize: 13,
-            marginBottom: 16,
-            border: "1px solid #5a3d0a",
-          }}
-        >
-          No single warehouse can fill a full truck right now — this is the closest, at{" "}
-          {Math.ceil(spotsUsed)} of {TARGET_SKIDS} spots from {selectedWarehouse}.
+      {notice && <div style={banner("green")}>{notice}</div>}
+
+      {warehousesPresent.length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          {warehousesPresent.map((wh) => {
+            const lines = trucks[wh] || EMPTY_LINES;
+            const spots = lines.reduce((s, l) => s + spotsForSkids(l.item, l.skids), 0);
+            const skids = lines.reduce((s, l) => s + l.skids, 0);
+            const full = spots >= TARGET_SKIDS;
+            return (
+              <button
+                key={wh}
+                onClick={() => selectWarehouse(wh)}
+                style={{
+                  flex: 1,
+                  padding: "10px 12px",
+                  textAlign: "left",
+                  borderRadius: 8,
+                  border: wh === active ? "2px solid var(--accent)" : "1px solid var(--border-mid)",
+                  background: "var(--bg-card)",
+                  color: "var(--text-primary)",
+                }}
+              >
+                <div style={{ fontSize: 13, fontWeight: 500 }}>{wh} truck</div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: spots > TARGET_SKIDS ? "var(--red-light)" : full ? "var(--green-light)" : spots > 0 ? "var(--amber-light)" : "var(--text-muted)",
+                  }}
+                >
+                  {Math.ceil(spots)} / {TARGET_SKIDS} spots{skids ? ` · ${skids} skids` : ""}
+                  {full && spots <= TARGET_SKIDS ? " · full" : ""}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {spotsUsed > TARGET_SKIDS && (
+        <div style={banner("red")}>
+          Over trailer capacity — {Math.ceil(spotsUsed)} of {TARGET_SKIDS} spots on the {active} truck.
         </div>
       )}
 
       <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-        <StatCard
-          label="Trailer spots"
-          value={`${Math.ceil(spotsUsed)} / ${TARGET_SKIDS}`}
-        />
+        <StatCard label="Trailer spots" value={`${Math.ceil(spotsUsed)} / ${TARGET_SKIDS}`} />
         <StatCard label="Skids loaded" value={`${skidsUsed}`} />
-        <StatCard label="Warehouse" value={selectedWarehouse || "—"} />
+        <StatCard label="Warehouse" value={active || "—"} />
         <StatCard
           label="Still needed"
-          value={unmet.length ? `${unmet.length} item${unmet.length === 1 ? "" : "s"}` : "None"}
-          warn={unmet.length > 0}
+          value={
+            !needs
+              ? "—"
+              : stillNeeded.length
+                ? `${stillNeeded.length} item${stillNeeded.length === 1 ? "" : "s"}`
+                : "None"
+          }
+          warn={stillNeeded.length > 0}
         />
       </div>
+
+      {active && (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 16, flexWrap: "wrap" }}>
+          <button onClick={autoFill} disabled={!needs || spotsLeft <= 0}>
+            Auto-fill this truck
+          </button>
+          <button onClick={clearTruck} disabled={lineItems.length === 0}>
+            Clear truck
+          </button>
+          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            {needs
+              ? `Build the ${active} truck from the "Still needed" list below, or auto-fill it.`
+              : "Upload the EVV DC PDF to see what's needed."}
+          </span>
+        </div>
+      )}
 
       {lineItems.length > 0 && (
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, marginBottom: 24 }}>
@@ -650,72 +748,91 @@ export default function TruckLoadBuilder() {
             </tr>
           </thead>
           <tbody>
-            {lineItems.map((li) => (
-              <tr key={li.id}>
-                <td style={cellStyle}>{li.item}</td>
-                <td style={cellStyle}>
-                  {li.description}
-                  {li.doubleStack && (
-                    <span
-                      style={{
-                        marginLeft: 8,
-                        fontSize: 11,
-                        color: "var(--green-light)",
-                        background: "var(--green-bg)",
-                        padding: "2px 6px",
-                        borderRadius: 4,
-                      }}
-                    >
-                      double-stacks
-                    </span>
-                  )}
-                </td>
-                <td style={cellStyle}>{li.warehouse}</td>
-                <td style={cellStyle}>{li.needed ?? "—"}</td>
-                <td style={cellStyle}>
-                  <button onClick={() => adjustSkids(li.id, -1)}>-</button>
-                  <span style={{ margin: "0 8px" }}>{li.skids}</span>
-                  <button onClick={() => adjustSkids(li.id, 1)}>+</button>
-                  <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>
-                    / {li.availableAtWarehouse} avail
-                  </span>
-                </td>
-                <td style={cellStyle}>{spotsForSkids(li.item, li.skids)}</td>
-                <td style={cellStyle}>
-                  <input
-                    type="number"
-                    min="0"
-                    value={li.weight || ""}
-                    onChange={(e) => setLineWeight(li.id, e.target.value)}
-                    placeholder="lbs"
-                    style={{ width: 70 }}
-                  />
-                  {li.weightIsEstimate && (
-                    <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: 4 }}>est.</span>
-                  )}
-                  {UNRELIABLE_WEIGHT_ITEMS.has(String(li.item)) && (
-                    <span
-                      style={{
-                        marginLeft: 4,
-                        fontSize: 11,
-                        color: "var(--amber-light)",
-                        background: "var(--amber-bg)",
-                        padding: "1px 5px",
-                        borderRadius: 4,
-                      }}
-                      title="Weight has varied a lot for this part across past loads — double check it"
-                    >
-                      check
-                    </span>
-                  )}
-                </td>
-                <td style={{ ...cellStyle, textAlign: "right" }}>
-                  <button onClick={() => removeLineItem(li.id)} aria-label="Remove">
-                    ✕
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {lineItems.map((li) => {
+              const row = needByItem.get(li.item);
+              const stock = stockAt(availability, booked, li.item, active);
+              const overNeed = row && li.skids > row.remaining;
+              return (
+                <tr key={li.id}>
+                  <td style={cellStyle}>{li.item}</td>
+                  <td style={cellStyle}>
+                    {li.description}
+                    {li.doubleStack && (
+                      <span
+                        style={{
+                          marginLeft: 8,
+                          fontSize: 11,
+                          color: "var(--green-light)",
+                          background: "var(--green-bg)",
+                          padding: "2px 6px",
+                          borderRadius: 4,
+                        }}
+                      >
+                        double-stacks
+                      </span>
+                    )}
+                  </td>
+                  <td style={cellStyle}>{li.warehouse}</td>
+                  <td
+                    style={{ ...cellStyle, color: overNeed ? "var(--amber-light)" : "inherit" }}
+                    title={overNeed ? "More skids than are still needed" : undefined}
+                  >
+                    {row ? row.remaining : "—"}
+                  </td>
+                  <td style={cellStyle}>
+                    <button onClick={() => adjustSkids(li.id, -1)}>-</button>
+                    <span style={{ margin: "0 8px" }}>{li.skids}</span>
+                    <button onClick={() => adjustSkids(li.id, 1)} disabled={li.skids >= stock}>
+                      +
+                    </button>
+                    <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>/ {stock} avail</span>
+                  </td>
+                  <td style={cellStyle}>{spotsForSkids(li.item, li.skids)}</td>
+                  <td style={cellStyle}>
+                    <input
+                      type="number"
+                      min="0"
+                      value={li.weight || ""}
+                      onChange={(e) => setLineWeight(li.id, e.target.value)}
+                      placeholder="lbs"
+                      style={{ width: 70 }}
+                    />
+                    {li.weightIsEstimate && (
+                      <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: 4 }}>est.</span>
+                    )}
+                    {UNRELIABLE_WEIGHT_ITEMS.has(String(li.item)) && (
+                      <span
+                        style={{
+                          marginLeft: 4,
+                          fontSize: 11,
+                          color: "var(--amber-light)",
+                          background: "var(--amber-bg)",
+                          padding: "1px 5px",
+                          borderRadius: 4,
+                        }}
+                        title="Weight has varied a lot for this part across past loads — double check it"
+                      >
+                        check
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ ...cellStyle, textAlign: "right" }}>
+                    <button onClick={() => removeLineItem(li.id)} aria-label="Remove">
+                      ✕
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            <tr style={{ fontWeight: 600 }}>
+              <td style={cellStyle} colSpan={4}>
+                Total
+              </td>
+              <td style={cellStyle}>{skidsUsed} skids</td>
+              <td style={cellStyle}>{spotsUsed}</td>
+              <td style={cellStyle}>{totalWeight != null ? `${fmtNum(totalWeight)} lbs` : "—"}</td>
+              <td style={cellStyle}></td>
+            </tr>
           </tbody>
         </table>
       )}
@@ -731,27 +848,24 @@ export default function TruckLoadBuilder() {
           }}
         >
           <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 10px" }}>
-            Generate Bill of Lading for this load ({selectedWarehouse})
+            Generate Bill of Lading for this load ({active})
           </p>
           <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
             <input
               placeholder="Carrier name"
               value={carrierName}
-              onChange={(e) => setCarrierName(e.target.value)}
+              onChange={(e) => setFormField("carrierName", e.target.value)}
             />
-            <input placeholder="SCAC" value={scac} onChange={(e) => setScac(e.target.value)} />
+            <input placeholder="SCAC" value={scac} onChange={(e) => setFormField("scac", e.target.value)} />
             <input
               placeholder="BOL number (auto-filled, editable)"
               value={bolNumber}
-              onChange={(e) => setBolNumber(e.target.value)}
+              onChange={(e) => setFormField("bolNumber", e.target.value)}
             />
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
             <label style={{ fontSize: 13, color: "var(--text-secondary)" }}>Signature:</label>
-            <select
-              value={selectedSignature}
-              onChange={(e) => setSelectedSignature(e.target.value)}
-            >
+            <select value={selectedSignature} onChange={(e) => setSelectedSignature(e.target.value)}>
               <option value="">(none selected)</option>
               {signatureNames.map((name) => (
                 <option key={name} value={name}>
@@ -767,13 +881,109 @@ export default function TruckLoadBuilder() {
             />
             <button onClick={addSignatureName}>Add</button>
           </div>
+          <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 10px" }}>
+            BOL totals: {skidsUsed} pallets ·{" "}
+            {totalWeight != null ? `${fmtNum(totalWeight)} lbs` : "weight not complete"}
+          </p>
           <button onClick={handleGenerateBol} disabled={generatingBol}>
             {generatingBol ? "Generating…" : "Download BOL (.docx)"}
           </button>
-          {lineItems.some((li) => !li.weight) && (
+          {totalWeight == null && (
             <span style={{ marginLeft: 12, fontSize: 12, color: "var(--amber-light)" }}>
-              Some lines have no weight history yet — those cells are blank for manual entry.
+              Some lines have no weight yet — the BOL's total weight stays blank until every line has one.
             </span>
+          )}
+        </div>
+      )}
+
+      {needs && availability && active && (
+        <div style={{ marginBottom: 24 }}>
+          <p style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 8 }}>
+            Still needed — add to the {active} truck
+            {stillNeeded.length ? ` (${stillNeeded.length})` : ""}
+          </p>
+          {stillNeeded.length === 0 ? (
+            <p style={{ fontSize: 13, color: "var(--green-light)" }}>
+              Nothing left on the needs list — everything is on a truck or a BOL.
+            </p>
+          ) : (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "var(--text-muted)" }}>
+                  <th style={cellStyle}>Item</th>
+                  <th style={cellStyle}>Description</th>
+                  <th style={cellStyle}>Still need</th>
+                  {warehousesPresent.map((wh) => (
+                    <th
+                      key={wh}
+                      style={{ ...cellStyle, color: wh === active ? "var(--green-light)" : "var(--text-muted)" }}
+                    >
+                      {wh} has
+                    </th>
+                  ))}
+                  <th style={cellStyle}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {stillNeeded.map((r) => {
+                  const room = Math.max(0, r.stock[active] - r.here);
+                  const bySpots = isDoubleStackable(r.item) ? Math.floor(spotsLeft * 2) : Math.floor(spotsLeft);
+                  const addQty = Math.min(r.unassigned, room, bySpots);
+                  const why =
+                    !r.inInventory
+                      ? "Not in offsite inventory"
+                      : room <= 0
+                        ? `None available at ${active}`
+                        : bySpots <= 0
+                          ? "Truck is full"
+                          : "";
+                  return (
+                    <tr key={r.item}>
+                      <td style={cellStyle}>{r.item}</td>
+                      <td style={cellStyle}>{r.description}</td>
+                      <td style={cellStyle}>
+                        {r.unassigned}
+                        {r.here > 0 && (
+                          <span style={{ color: "var(--text-muted)" }}> ({r.here} on truck)</span>
+                        )}
+                      </td>
+                      {warehousesPresent.map((wh) => (
+                        <td
+                          key={wh}
+                          style={{
+                            ...cellStyle,
+                            fontWeight: wh === active ? 600 : 400,
+                            color: r.stock[wh] > 0 ? (wh === active ? "var(--green-light)" : "inherit") : "var(--text-muted)",
+                          }}
+                        >
+                          {r.stock[wh] > 0 ? r.stock[wh] : "—"}
+                        </td>
+                      ))}
+                      <td style={{ ...cellStyle, textAlign: "right" }}>
+                        {addQty > 0 ? (
+                          <button onClick={() => addToTruck(r, addQty)}>Add {addQty}</button>
+                        ) : (
+                          <span style={{ fontSize: 12, color: "var(--amber-light)" }}>{why}</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+          {coveredElsewhere.length > 0 && (
+            <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 10 }}>
+              Already covered:{" "}
+              {coveredElsewhere
+                .map((r) => {
+                  const parts = [];
+                  if (r.bookedAll) parts.push(`${r.bookedAll} on today's BOLs`);
+                  if (r.elsewhere) parts.push(`${r.elsewhere} on another truck`);
+                  return `${r.item} (needed ${r.movePallets}: ${parts.join(", ")})`;
+                })
+                .join(" · ")}
+            </p>
           )}
         </div>
       )}
@@ -788,8 +998,11 @@ export default function TruckLoadBuilder() {
             marginBottom: 24,
           }}
         >
-          <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 10px" }}>
+          <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 4px" }}>
             Load history ({loadHistory.length})
+          </p>
+          <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 10px" }}>
+            BOLs from today count as already ordered. Release one to put its skids back on the needs list.
           </p>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
@@ -799,6 +1012,7 @@ export default function TruckLoadBuilder() {
                 <th style={cellStyle}>BOL #</th>
                 <th style={cellStyle}>Skids</th>
                 <th style={cellStyle}>Signed by</th>
+                <th style={cellStyle}></th>
               </tr>
             </thead>
             <tbody>
@@ -809,6 +1023,9 @@ export default function TruckLoadBuilder() {
                   <td style={cellStyle}>{h.bolNumber}</td>
                   <td style={cellStyle}>{h.totalSkids}</td>
                   <td style={cellStyle}>{h.signatureName || "—"}</td>
+                  <td style={{ ...cellStyle, textAlign: "right" }}>
+                    {h.date === todayStr() && <button onClick={() => releaseLoad(h)}>Release</button>}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -818,30 +1035,6 @@ export default function TruckLoadBuilder() {
               Showing the 20 most recent — {loadHistory.length} total logged.
             </p>
           )}
-        </div>
-      )}
-
-      {unmet.length > 0 && (
-        <div>
-          <p style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 8 }}>
-            Not on this load
-          </p>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-            <tbody>
-              {unmet.map((u) => (
-                <tr key={u.item}>
-                  <td style={cellStyle}>{u.item}</td>
-                  <td style={cellStyle}>{u.description || availability?.get(u.item)?.description || ""}</td>
-                  <td style={{ ...cellStyle, color: "var(--amber-light)" }}>{u.reason}</td>
-                  <td style={{ ...cellStyle, textAlign: "right" }}>
-                    {(availability?.get(u.item)?.byWarehouse?.[selectedWarehouse]?.length || 0) > 0 && (
-                      <button onClick={() => addUnmetItem(u)}>Add to load</button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </div>
       )}
     </div>
